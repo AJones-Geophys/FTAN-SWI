@@ -1,0 +1,735 @@
+"""
+================================================================================
+STEP5_Regularize_Layered_DATs_to_Uniform_Grid_(VS_VP_RHO)_v5.py
+================================================================================
+
+PURPOSE
+-------
+This script converts layered inversion output, e.g. MASW / refraction output,
+exported as a Surfer-style DAT file into a regularly sampled XYZ dataset
+suitable for gridding, e.g. Block Kriging in Surfer.
+
+The input DAT file represents each 1D model as:
+    - a surface point, RL, with the first layer properties
+    - subsequent rows at the base of each layer with that layer's properties
+
+This structure defines layer boundaries only, i.e. non-uniform vertical support.
+Direct interpolation of these points can lead to artefacts and poor representation
+of layering.
+
+This script reconstructs valid layer intervals and converts them to uniform
+vertical support prior to interpolation.
+
+--------------------------------------------------------------------------------
+
+PROCESS OVERVIEW
+----------------
+1. Read DAT file containing:
+       X, RL, VS, VP, RHO
+
+2. Read BLN / extent file and construct a top and bottom envelope.
+
+3. For each X location:
+       Reconstruct piecewise-constant layer intervals from layer bases.
+
+4. Create a regular vertical sampling grid, dz.
+
+5. Sample each column onto this grid, using constant properties per layer.
+
+6. Interpolate laterally between adjacent columns at each RL.
+
+7. Mask output to section extent using the BLN / polygon envelope.
+
+8. Export:
+       - Regularized XYZ datasets, VS, VP, RHO
+       - Combined CSV output
+       - Optional matrix-style CSV outputs
+
+--------------------------------------------------------------------------------
+
+KEY V4 FIXES INSERTED INTO THE ORIGINAL VERSION
+-----------------------------------------------
+1. Robustly reads Surfer BLN files by detecting and skipping the BLN header row.
+2. Handles BLN files where the detailed topographic polyline is followed by a
+   constant lower boundary.
+3. Uses DAT X coverage for the regular X grid where the DAT lies within the BLN.
+   If the DAT extends outside the BLN, the X grid is clipped to the BLN extents.
+4. Keeps vertical / Y limits controlled by the BLN. Everything below the BLN
+   minimum Y / RL is excluded by the section mask.
+5. Adds input checking, numeric coercion, output-folder creation and optional
+   QA/QC diagnostics.
+6. Preserves the original STEP5 processing logic:
+       - piecewise-constant vertical layer reconstruction
+       - lateral interpolation at each RL
+       - BLN-based masking
+       - XYZ, combined CSV and matrix CSV outputs
+
+--------------------------------------------------------------------------------
+
+INPUT REQUIREMENTS
+------------------
+1. DAT file from previous STEP4 script:
+       Format: whitespace-delimited
+       Columns: X RL VS VP RHO
+
+2. Cross-section extent file:
+       - Surfer BLN file generated from STEP4, OR
+       - equivalent XY polygon / topographic envelope
+
+--------------------------------------------------------------------------------
+
+OUTPUT
+------
+- Regularized XYZ point files:
+       *_VS.xyz
+       *_VP.xyz
+       *_RHO.xyz
+
+- Combined dataset:
+       *_points.csv
+
+- Optional matrix-style CSV grids:
+       *_VS_matrix.csv
+       *_VP_matrix.csv
+       *_RHO_matrix.csv
+
+These outputs are suitable for import into Surfer, Grid Data, or for other
+interpolation / post-processing workflows.
+
+--------------------------------------------------------------------------------
+
+RECOMMENDED SETTINGS
+--------------------
+Typical starting values:
+
+    dx = 2.0 to 4.0 m      horizontal spacing
+    dz = 0.5 to 1.0 m      vertical spacing
+
+    lateral_method:
+        "linear"   smoother sections
+        "nearest"  more blocky / preserves sharp changes
+
+Guidance:
+- dz should be smaller than the minimum meaningful layer thickness.
+- dx should be similar to midpoint spacing.
+
+--------------------------------------------------------------------------------
+
+ASSUMPTIONS AND LIMITATIONS
+---------------------------
+- Layers are treated as piecewise-constant, i.e. block model.
+- No geological interpretation is applied.
+- Lateral interpolation is simple 1D interpolation at each RL level.
+- This does not reproduce fine-scale heterogeneity or inversion uncertainty.
+
+This is a preprocessing step to improve interpolation behaviour. It is not a
+substitute for geological modelling.
+
+--------------------------------------------------------------------------------
+
+USER INSTRUCTIONS
+-----------------
+1. Edit the USER SETTINGS section below:
+       - dat_file
+       - extent_file
+       - dx
+       - dz
+       - lateral_method
+       - out_prefix
+       - export_matrix_csv
+       - print_diagnostics
+
+2. Run the script.
+
+3. Import the exported *_VS.xyz, *_VP.xyz, or *_RHO.xyz files into Surfer.
+
+4. Recommended Surfer workflow:
+       - Use Block Kriging.
+       - Apply strong horizontal anisotropy.
+       - Blank / crop after gridding using the BLN extent.
+
+--------------------------------------------------------------------------------
+
+OUTPUT FILE NAMING AND OVERWRITE PROTECTION
+-------------------------------------------
+This script will NEVER overwrite an existing file.
+
+Each run is saved with a descriptive name containing:
+    - output prefix
+    - dx
+    - dz
+    - lateral interpolation method
+    - timestamp
+
+If a file with the same name already exists, an incrementing suffix is added:
+    _01, _02, _03, etc.
+
+Example:
+    Line1_regularized_dx2_dz0.5_linear_1432PM_points.csv
+    Line1_regularized_dx2_dz0.5_linear_1432PM_VS.xyz
+    Line1_regularized_dx2_dz0.5_linear_1432PM_VS_matrix.csv
+
+================================================================================
+"""
+
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+
+# ============================================================
+# USER SETTINGS
+# ============================================================
+
+# Input DAT from previous script. Must contain columns: X RL VS VP RHO.
+dat_file = r"Rentails_Line_1_0756AM.DAT"
+
+# BLN polygon or 2-column XY polygon / topographic envelope.
+extent_file = r"Rentails_Line_1_0756AM.BLN"
+
+# Recommended starting values.
+dx = 2.0                         # horizontal grid spacing, m
+dz = 0.5                         # vertical grid spacing in RL units, m
+lateral_method = "linear"         # "linear" or "nearest"
+
+# Output prefix, directory + base name without extension.
+out_prefix = r"Line1_regularized"
+
+# If True, export matrix-style CSV grids as well as point files.
+export_matrix_csv = True
+
+# If True, print QA/QC diagnostics to console.
+print_diagnostics = True
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def read_dat(dat_path):
+    """
+    Read DAT file with 5 whitespace-delimited columns:
+        X RL VS VP RHO
+    """
+    dat_path = Path(dat_path)
+
+    if not dat_path.exists():
+        raise FileNotFoundError(f"DAT file not found: {dat_path}")
+
+    df = pd.read_csv(
+        dat_path,
+        sep=r"\s+",
+        header=None,
+        names=["X", "RL", "VS", "VP", "RHO"],
+        engine="python"
+    )
+
+    for col in ["X", "RL", "VS", "VP", "RHO"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["X", "RL", "VS", "VP", "RHO"]).copy()
+
+    if df.empty:
+        raise ValueError("DAT file was read, but no valid X/RL/VS/VP/RHO rows were found.")
+
+    df = df.sort_values(["X", "RL"], ascending=[True, False]).reset_index(drop=True)
+    return df
+
+
+def read_extent_polygon(path):
+    """
+    Read either:
+      - Surfer BLN polygon; first line is usually "n,flag"
+      - simple 2-column X,Y polygon / line file
+
+    Returns:
+        x_poly, y_poly, skipped_bln_header
+    """
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Extent / BLN file not found: {path}")
+
+    raw = pd.read_csv(
+        path,
+        header=None,
+        comment="#",
+        sep=r"[,\s]+",
+        engine="python"
+    )
+
+    raw = raw.dropna(how="all")
+
+    if raw.shape[1] < 2:
+        raise ValueError("Extent file must contain at least two columns: X and Y/RL.")
+
+    raw = raw.iloc[:, :2].copy()
+
+    for col in raw.columns:
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    raw = raw.dropna().reset_index(drop=True)
+
+    if len(raw) < 2:
+        raise ValueError("Extent file could not be parsed into at least two XY points.")
+
+    skipped_bln_header = False
+
+    # Detect Surfer BLN header, e.g. 321,0. The first value is normally the
+    # number of following vertices, and the second value is the blanking flag.
+    # Allow +/- 1 tolerance for closure.
+    if len(raw) >= 3:
+        first_x = float(raw.iloc[0, 0])
+        first_y = float(raw.iloc[0, 1])
+
+        if first_x.is_integer() and first_y in (0.0, 1.0):
+            n_vertices = int(first_x)
+            following_rows = len(raw) - 1
+            if abs(n_vertices - following_rows) <= 1:
+                raw = raw.iloc[1:].reset_index(drop=True)
+                skipped_bln_header = True
+
+    x = raw.iloc[:, 0].to_numpy(dtype=float)
+    y = raw.iloc[:, 1].to_numpy(dtype=float)
+
+    if len(x) < 2:
+        raise ValueError("Extent file could not be parsed into at least two XY points after BLN header handling.")
+
+    return x, y, skipped_bln_header
+
+
+def build_top_bottom_from_polygon(x_poly, y_poly):
+    """
+    Construct top and bottom envelopes as functions of X.
+
+    This implementation is robust for the BLN structure discussed in this
+    workflow:
+      - detailed topographic polyline forming the upper boundary
+      - lower boundary defined by the minimum Y/RL of the BLN polygon
+
+    The lower boundary is treated as a constant minimum RL. This prevents the
+    common failure case where a BLN with only topographic points at most X
+    values is misinterpreted as having bottom = top along most of the line.
+    """
+    x_poly = np.asarray(x_poly, dtype=float)
+    y_poly = np.asarray(y_poly, dtype=float)
+
+    if len(x_poly) < 2:
+        raise ValueError("Extent polygon appears too short to define an envelope.")
+
+    # Remove final closure point if it duplicates the first point.
+    if len(x_poly) > 2:
+        if np.isclose(x_poly[0], x_poly[-1]) and np.isclose(y_poly[0], y_poly[-1]):
+            x_poly = x_poly[:-1]
+            y_poly = y_poly[:-1]
+
+    bottom_rl = float(np.nanmin(y_poly))
+    tol = 1e-9
+
+    # Points above the minimum Y/RL define the upper/topographic envelope.
+    top_mask = y_poly > bottom_rl + tol
+    x_top = x_poly[top_mask]
+    y_top = y_poly[top_mask]
+
+    if len(x_top) < 2:
+        raise ValueError(
+            "Could not identify a valid top envelope from the BLN/extent file. "
+            "Check that the file contains topographic points above the lower boundary."
+        )
+
+    # Sort and merge duplicate X on the top line.
+    top_df = pd.DataFrame({"X": x_top, "TOP": y_top})
+    top_df = top_df.sort_values("X")
+    top_df = top_df.groupby("X", as_index=False)["TOP"].mean()
+
+    x_env = top_df["X"].to_numpy(dtype=float)
+    y_top = top_df["TOP"].to_numpy(dtype=float)
+    y_bot = np.full_like(y_top, bottom_rl, dtype=float)
+
+    if np.any(y_top <= y_bot):
+        bad_count = int(np.sum(y_top <= y_bot))
+        raise ValueError(
+            f"Invalid envelope: {bad_count} top-envelope values are at or below the bottom envelope."
+        )
+
+    return x_env, y_top, y_bot
+
+
+def reconstruct_column_intervals(df_col):
+    """
+    Reconstruct piecewise-constant intervals for one X column.
+
+    The earlier processing writes:
+      - one surface point with first-layer property
+      - then one point at the base of each layer with that layer's property
+
+    Therefore, for sorted RL descending:
+      interval between RL[i-1] and RL[i] takes property at row i.
+
+    This preserves the original STEP5 interval logic.
+    """
+    df_col = df_col.sort_values("RL", ascending=False).reset_index(drop=True)
+
+    # Remove exact duplicate RL rows if present, keep first.
+    df_col = df_col.drop_duplicates(subset=["RL"], keep="first").reset_index(drop=True)
+
+    if len(df_col) < 2:
+        return None
+
+    intervals = []
+    for i in range(1, len(df_col)):
+        rl_top = float(df_col.loc[i - 1, "RL"])
+        rl_bot = float(df_col.loc[i, "RL"])
+
+        if rl_top <= rl_bot:
+            continue
+
+        intervals.append({
+            "RL_TOP": rl_top,
+            "RL_BOT": rl_bot,
+            "VS": float(df_col.loc[i, "VS"]),
+            "VP": float(df_col.loc[i, "VP"]),
+            "RHO": float(df_col.loc[i, "RHO"]),
+        })
+
+    if len(intervals) == 0:
+        return None
+
+    return intervals
+
+
+def sample_column_at_rl(intervals, rl):
+    """
+    Return piecewise-constant properties at a given RL for one X column.
+    """
+    for iv in intervals:
+        if iv["RL_TOP"] >= rl > iv["RL_BOT"]:
+            return iv["VS"], iv["VP"], iv["RHO"]
+
+    # Include the very bottom boundary point.
+    if intervals and np.isclose(rl, intervals[-1]["RL_BOT"]):
+        iv = intervals[-1]
+        return iv["VS"], iv["VP"], iv["RHO"]
+
+    return np.nan, np.nan, np.nan
+
+
+def point_in_vertical_extent(x, rl, x_env, top_env, bot_env):
+    """
+    Check if (x, rl) lies inside the vertical section extent.
+    """
+    if x < x_env.min() or x > x_env.max():
+        return False
+
+    top = np.interp(x, x_env, top_env)
+    bot = np.interp(x, x_env, bot_env)
+
+    return (rl <= top) and (rl >= bot)
+
+
+def lateral_interpolate(x_query, values_by_x, x_cols, method="linear"):
+    """
+    Interpolate property laterally at fixed RL using neighbouring columns.
+    values_by_x must be same length as x_cols.
+
+    This preserves the earlier STEP5 behaviour:
+      - nearest is explicit nearest-neighbour
+      - linear uses nearest fallback outside the valid lateral support
+    """
+    x_cols = np.asarray(x_cols, dtype=float)
+    vals = np.asarray(values_by_x, dtype=float)
+
+    valid = np.isfinite(vals)
+    if valid.sum() == 0:
+        return np.nan
+    if valid.sum() == 1:
+        return float(vals[valid][0])
+
+    xv = x_cols[valid]
+    vv = vals[valid]
+
+    method = method.lower().strip()
+
+    if method == "nearest":
+        idx = np.argmin(np.abs(xv - x_query))
+        return float(vv[idx])
+
+    if method != "linear":
+        raise ValueError("lateral_method must be either 'linear' or 'nearest'.")
+
+    # Linear with nearest fallback outside support, as per earlier script.
+    if x_query <= xv.min():
+        return float(vv[np.argmin(np.abs(xv - x_query))])
+    if x_query >= xv.max():
+        return float(vv[np.argmin(np.abs(xv - x_query))])
+
+    return float(np.interp(x_query, xv, vv))
+
+
+def choose_x_grid_limits(dat_x_min, dat_x_max, bln_x_min, bln_x_max):
+    """
+    Use DAT X extents where they fall inside the BLN.
+    Clip to BLN extents where DAT extends outside the BLN.
+    """
+    x_min = max(float(dat_x_min), float(bln_x_min))
+    x_max = min(float(dat_x_max), float(bln_x_max))
+
+    if x_max <= x_min:
+        raise ValueError(
+            "No overlapping X range exists between DAT and BLN extents. "
+            f"DAT X range = {dat_x_min} to {dat_x_max}; "
+            f"BLN X range = {bln_x_min} to {bln_x_max}."
+        )
+
+    return x_min, x_max
+
+
+def make_regular_grid(dat_df, x_env, top_env, bot_env, dx=2.5, dz=1.0, lateral_method="linear"):
+    """
+    Create regularized X-RL property grid by:
+      1) reconstructing piecewise-constant vertical intervals for each original X
+      2) sampling each column at regular RL
+      3) interpolating laterally between neighbouring columns at the same RL
+      4) masking outside the section extent
+
+    Horizontal X extent logic:
+      - use DAT extents where the DAT lies within the BLN
+      - clip to BLN extents if the DAT extends beyond the BLN
+
+    Vertical/RL extents remain controlled by the BLN.
+    """
+    if dx <= 0:
+        raise ValueError("dx must be greater than zero.")
+    if dz <= 0:
+        raise ValueError("dz must be greater than zero.")
+
+    x_cols_all = np.array(sorted(dat_df["X"].unique()), dtype=float)
+
+    # Rebuild intervals for each original X.
+    columns = {}
+    for x in x_cols_all:
+        dfc = dat_df[np.isclose(dat_df["X"], x)].copy()
+        iv = reconstruct_column_intervals(dfc)
+        if iv is not None:
+            columns[x] = iv
+
+    x_cols = np.array(sorted(columns.keys()), dtype=float)
+
+    if len(x_cols) < 2:
+        raise ValueError("Fewer than two valid X columns were reconstructed from the DAT file.")
+
+    dat_x_min = float(x_cols.min())
+    dat_x_max = float(x_cols.max())
+    bln_x_min = float(x_env.min())
+    bln_x_max = float(x_env.max())
+
+    x_min, x_max = choose_x_grid_limits(dat_x_min, dat_x_max, bln_x_min, bln_x_max)
+
+    # Vertical limits remain controlled by the BLN.
+    z_min = float(bot_env.min())
+    z_max = float(top_env.max())
+
+    # Regular grid. Do not generate X nodes beyond the selected/clipped X extent.
+    x_grid = np.arange(x_min, x_max + dx * 0.5, dx)
+    x_grid = x_grid[x_grid <= x_max + 1e-9]
+
+    z_grid = np.arange(z_min, z_max + dz * 0.5, dz)
+    z_grid = z_grid[z_grid <= z_max + 1e-9]
+
+    rows = []
+
+    # Loop through regular grid nodes.
+    for xq in x_grid:
+        for zq in z_grid:
+            if not point_in_vertical_extent(xq, zq, x_env, top_env, bot_env):
+                continue
+
+            vs_vals = []
+            vp_vals = []
+            rho_vals = []
+
+            for xc in x_cols:
+                vs, vp, rho = sample_column_at_rl(columns[xc], zq)
+                vs_vals.append(vs)
+                vp_vals.append(vp)
+                rho_vals.append(rho)
+
+            vs_q = lateral_interpolate(xq, vs_vals, x_cols, method=lateral_method)
+            vp_q = lateral_interpolate(xq, vp_vals, x_cols, method=lateral_method)
+            rho_q = lateral_interpolate(xq, rho_vals, x_cols, method=lateral_method)
+
+            if not np.isfinite(vs_q) and not np.isfinite(vp_q) and not np.isfinite(rho_q):
+                continue
+
+            rows.append([xq, zq, vs_q, vp_q, rho_q])
+
+    out_df = pd.DataFrame(rows, columns=["X", "RL", "VS", "VP", "RHO"])
+
+    if out_df.empty:
+        raise ValueError(
+            "Regularized grid is empty. Check DAT intervals, BLN extent, dx/dz, "
+            "and whether the model RL range overlaps the BLN envelope."
+        )
+
+    return out_df, x_grid, z_grid
+
+
+def get_unique_filename(base_path):
+    """
+    Ensure filename is unique by appending a numbered suffix if needed.
+    Never overwrites an existing file.
+    """
+    base_path = Path(base_path)
+
+    if not base_path.exists():
+        return base_path
+
+    stem = base_path.stem
+    suffix = base_path.suffix
+    parent = base_path.parent
+
+    i = 1
+    while True:
+        new_name = parent / f"{stem}_{i:02d}{suffix}"
+        if not new_name.exists():
+            return new_name
+        i += 1
+
+
+def export_outputs(df_grid, x_grid, z_grid, out_prefix, dx, dz, method, export_matrix_csv=True):
+    """
+    Export outputs with overwrite protection and descriptive naming.
+    """
+    timestamp = datetime.now().strftime("%H%M%p")
+
+    out_prefix = Path(out_prefix)
+
+    if out_prefix.parent == Path("."):
+        parent = Path.cwd()
+    else:
+        parent = out_prefix.parent
+        parent.mkdir(parents=True, exist_ok=True)
+
+    base_name = f"{out_prefix.name}_dx{dx:g}_dz{dz:g}_{method}_{timestamp}"
+
+    combined_path = parent / f"{base_name}_points.csv"
+    combined_path = get_unique_filename(combined_path)
+    df_grid.to_csv(combined_path, index=False)
+
+    xyz_paths = {}
+    for prop in ["VS", "VP", "RHO"]:
+        p = parent / f"{base_name}_{prop}.xyz"
+        p = get_unique_filename(p)
+        df_grid[["X", "RL", prop]].to_csv(p, index=False, header=False, sep=" ")
+        xyz_paths[prop] = p
+
+    matrix_paths = {}
+    if export_matrix_csv:
+        for prop in ["VS", "VP", "RHO"]:
+            pivot = df_grid.pivot_table(index="RL", columns="X", values=prop, aggfunc="first")
+            pivot = pivot.sort_index(ascending=False).sort_index(axis=1)
+
+            p = parent / f"{base_name}_{prop}_matrix.csv"
+            p = get_unique_filename(p)
+            pivot.to_csv(p)
+            matrix_paths[prop] = p
+
+    print("\nSaved outputs:")
+    print(f"  Points file: {combined_path}")
+
+    for prop, path in xyz_paths.items():
+        print(f"  {prop} XYZ:    {path}")
+
+    if export_matrix_csv:
+        for prop, path in matrix_paths.items():
+            print(f"  {prop} Matrix: {path}")
+
+    return combined_path, xyz_paths, matrix_paths
+
+
+def print_diagnostics_summary(dat_df, x_poly, y_poly, x_env, top_env, bot_env, skipped_bln_header, x_grid, z_grid, df_grid):
+    """
+    Print QA/QC diagnostics for the run.
+    """
+    unique_x = np.array(sorted(dat_df["X"].unique()), dtype=float)
+
+    print("\nDAT diagnostics")
+    print("----------------")
+    print(f"Rows: {len(dat_df)}")
+    print(f"Unique X count: {len(unique_x)}")
+    print(f"DAT X min/max: {unique_x.min():.3f} / {unique_x.max():.3f}")
+    print(f"DAT RL min/max: {dat_df['RL'].min():.3f} / {dat_df['RL'].max():.3f}")
+
+    print("\nBLN / extent diagnostics")
+    print("------------------------")
+    print(f"Skipped BLN header: {skipped_bln_header}")
+    print(f"Raw polygon point count after header handling: {len(x_poly)}")
+    print(f"Raw BLN X min/max: {np.nanmin(x_poly):.3f} / {np.nanmax(x_poly):.3f}")
+    print(f"Raw BLN Y min/max: {np.nanmin(y_poly):.3f} / {np.nanmax(y_poly):.3f}")
+    print(f"Envelope X min/max: {np.nanmin(x_env):.3f} / {np.nanmax(x_env):.3f}")
+    print(f"Top envelope min/max: {np.nanmin(top_env):.3f} / {np.nanmax(top_env):.3f}")
+    print(f"Bottom envelope min/max: {np.nanmin(bot_env):.3f} / {np.nanmax(bot_env):.3f}")
+
+    print("\nGrid diagnostics")
+    print("----------------")
+    print(f"x_grid count: {len(x_grid)}")
+    print(f"x_grid min/max: {np.nanmin(x_grid):.3f} / {np.nanmax(x_grid):.3f}")
+    print(f"z_grid count: {len(z_grid)}")
+    print(f"z_grid min/max: {np.nanmin(z_grid):.3f} / {np.nanmax(z_grid):.3f}")
+    print(f"Output rows: {len(df_grid)}")
+    print(f"Output unique X count: {df_grid['X'].nunique()}")
+    print(f"Output unique RL count: {df_grid['RL'].nunique()}")
+    print(f"Output X min/max: {df_grid['X'].min():.3f} / {df_grid['X'].max():.3f}")
+    print(f"Output RL min/max: {df_grid['RL'].min():.3f} / {df_grid['RL'].max():.3f}")
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    print("Reading DAT file...")
+    dat_df = read_dat(dat_file)
+
+    print("Reading extent file...")
+    x_poly, y_poly, skipped_bln_header = read_extent_polygon(extent_file)
+    x_env, top_env, bot_env = build_top_bottom_from_polygon(x_poly, y_poly)
+
+    print("Building regularized grid...")
+    df_grid, xg, zg = make_regular_grid(
+        dat_df,
+        x_env, top_env, bot_env,
+        dx=dx,
+        dz=dz,
+        lateral_method=lateral_method
+    )
+
+    if print_diagnostics:
+        print_diagnostics_summary(
+            dat_df=dat_df,
+            x_poly=x_poly,
+            y_poly=y_poly,
+            x_env=x_env,
+            top_env=top_env,
+            bot_env=bot_env,
+            skipped_bln_header=skipped_bln_header,
+            x_grid=xg,
+            z_grid=zg,
+            df_grid=df_grid
+        )
+
+    print("Exporting outputs...")
+    export_outputs(
+        df_grid,
+        xg,
+        zg,
+        out_prefix,
+        dx=dx,
+        dz=dz,
+        method=lateral_method,
+        export_matrix_csv=export_matrix_csv
+    )
+
+    print("\nDone.")
+    print(f"Regularized points written for {len(df_grid)} grid nodes.")
