@@ -97,8 +97,8 @@ def MakeDATfile():
             Vs_file  = source_dir+"/"+file+".txt"                                       
             d1  = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=0)*1e3   ## Read in layer thickness column and convert km to m    (Negative down from surface for RL)
             d2  = np.cumsum(d1)                                                         ## Sum the layer thickness to calculate the max depth
-            Vs  = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=2)*1e3   ## Read in the P-wave velocities for each layer and convert km/s to m/s.
-            Vp  = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=1)*1e3   ## Read in the S-wave velocities for each layer and convert km/s to m/s.
+            Vs  = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=2)*1e3   ## Read in the S-wave velocities for each layer and convert km/s to m/s.
+            Vp  = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=1)*1e3   ## Read in the P-wave velocities for each layer and convert km/s to m/s.
             rho = np.genfromtxt(Vs_file, skip_header=8, skip_footer=7, usecols=3)*1e3   ## Read in Rho for each layer and convert g/cm^3 to kg/m^3
             di  = f(midpoint)                                                           ## Interpolate elevation data at the chainage of the midpoint
             d   = di-d2                         ## Calculate the elevation of the lowest layer
