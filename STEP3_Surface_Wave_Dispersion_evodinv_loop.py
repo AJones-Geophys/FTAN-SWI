@@ -107,13 +107,13 @@ for _ in range(num_layers):
 wave_type           = "rayleigh"      # options: "rayleigh", "love"
 mode                = 0               # options: 0,1,2, 0 - fundamental mode
 velocity_type       = "group"         # options: "phase" "group"
-increasing_vel_flag = "True"          # Set inversion to unconstrained or constrained. options: True, False
+increasing_vel_flag = True            # Set inversion to unconstrained or constrained. options: True, False
                                       # False - unconstrained inversion, velocity jumps across layers are unconstrained
                                       # True - constrained inversion, velocity always increases with depth and across layers
 max_depth           = 0.040           # expected/target investigation depth [kilometers]
                                       # WHAT max_depth PRACTICALLY DOES IN THIS SCRIPT:
                                       # 1. It is passed into factory.prior(x, [0.0, max_depth], [vs_min, vs_max], alpha=smooth_fact)
-                                      #    when increasing_vel_flag == "True". In that constrained-inversion case, max_depth contributes
+                                      #    when increasing_vel_flag is True. In that constrained-inversion case, max_depth contributes
                                       #    to a soft regularization / prior term used during optimization.
                                       # 2. Because it enters that prior term, it can influence the inversion result indirectly by
                                       #    changing how candidate models are penalized, especially in the constrained inversion mode.
@@ -143,6 +143,105 @@ threshold_percentile = 20           # This is the percentile of misfit values us
                                     # of misfit values are selected.
                                     # tip: select a reasonably large percentile (larger misfit) if the inversion 
                                     # converges faster (look up the misfit vs. iterations figure).
+
+
+
+def validate_mode(mode_value):
+    if mode_value not in (0, 1, 2):
+        raise ValueError(f"mode must be one of 0, 1, or 2. Received: {mode_value}")
+    return mode_value
+
+
+
+def validate_dispersion_file(filepath, exclude_first_n_periods=0, exclude_last_n_periods=0):
+    """
+    Read and validate a dispersion file.
+
+    Expected format:
+        column 1 = period [s]
+        column 2 = velocity [m/s]
+
+    Returns:
+        obs_period, obs_grp_vel_km_s
+    """
+    filepath = Path(filepath)
+
+    if not filepath.exists():
+        raise FileNotFoundError(f"Dispersion file not found: {filepath}")
+
+    try:
+        data = np.loadtxt(filepath)
+    except Exception as exc:
+        raise ValueError(f"Could not read dispersion file: {filepath}") from exc
+
+    data = np.asarray(data, dtype=float)
+
+    if data.ndim == 1:
+        if data.size < 2:
+            raise ValueError(
+                f"Dispersion file must contain at least 2 numeric columns: {filepath}"
+            )
+        data = data.reshape(1, -1)
+
+    if data.shape[1] < 2:
+        raise ValueError(
+            f"Dispersion file must contain at least 2 columns (period, velocity): {filepath}"
+        )
+
+    data = data[:, :2]
+
+    if not np.isfinite(data).all():
+        raise ValueError(f"Dispersion file contains NaN or infinite values: {filepath}")
+
+    if exclude_first_n_periods < 0 or exclude_last_n_periods < 0:
+        raise ValueError("exclude_first_n_periods and exclude_last_n_periods must be >= 0")
+
+    nrows = data.shape[0]
+    if exclude_first_n_periods + exclude_last_n_periods >= nrows:
+        raise ValueError(
+            "Excluded periods remove all data points. "
+            f"File: {filepath}; rows={nrows}, "
+            f"exclude_first={exclude_first_n_periods}, exclude_last={exclude_last_n_periods}"
+        )
+
+    start_idx = exclude_first_n_periods
+    end_idx = nrows - exclude_last_n_periods if exclude_last_n_periods > 0 else nrows
+    data = data[start_idx:end_idx, :]
+
+    if data.shape[0] < 2:
+        raise ValueError(
+            f"At least 2 dispersion points are required after exclusion: {filepath}"
+        )
+
+    obs_period = data[:, 0]
+    obs_grp_vel = data[:, 1] / 1e3
+
+    if np.any(obs_period <= 0):
+        raise ValueError(f"Periods must be > 0 for log interpolation: {filepath}")
+
+    if np.any(obs_grp_vel <= 0):
+        raise ValueError(f"Velocities must be > 0: {filepath}")
+
+    order = np.argsort(obs_period)
+    obs_period = obs_period[order]
+    obs_grp_vel = obs_grp_vel[order]
+
+    unique_periods, unique_idx = np.unique(obs_period, return_index=True)
+    obs_period = unique_periods
+    obs_grp_vel = obs_grp_vel[unique_idx]
+
+    if obs_period.size < 2:
+        raise ValueError(
+            f"Need at least 2 unique period samples after sorting/deduplication: {filepath}"
+        )
+
+    if not np.all(np.diff(obs_period) > 0):
+        raise ValueError(f"Periods must be strictly increasing after validation: {filepath}")
+
+    return obs_period, obs_grp_vel
+
+
+mode = validate_mode(mode)
 
 # Start Time
 starttime = datetime.datetime.now()
@@ -207,7 +306,7 @@ input("\nHit ENTER to continue\n")
 
 
 # configure inversion set-up
-if increasing_vel_flag == "True":
+if increasing_vel_flag:
     model.configure(
         optimizer      = optmz,  
         misfit         = msft,  
@@ -240,38 +339,24 @@ else:
 for lines in range(line_no):
         dispfiles.readline()        
 
-print('Inversion uses the interpolated dispersion curve\n\n')
+print(f'Inversion uses the interpolated dispersion curve for mode {mode} ({wave_type}, {velocity_type})\n\n')
 
 # loop through inversions        
 for dispfilename in dispfiles:
+    dispfilename = dispfilename.strip()
     print("\nWORKING ON:", dispfilename, "File No:",line_no+1)
     
-    sacfname = Path(dispfilename.strip()).stem  # common string for saved file names
+    sacfname = Path(dispfilename).stem  # common string for saved file names
     
     
     # STEP1: DISPERSION CURVE INTERPOLATION
     # -------------------------------------------------------------------------------------
     
-    data          = np.loadtxt(dispfilename.strip())           # remove \n with strip()
-    
-    # period exclusion switch
-    # obs_period [s],  obs_grp_vel[km/s]
-    if ( (exclude_first_n_periods > 0) and (exclude_last_n_periods == 0) ) :
-        obs_period    = data[exclude_first_n_periods:,0]           
-        obs_grp_vel   = data[exclude_first_n_periods:,1]/1e3       
-        
-    elif ((exclude_last_n_periods > 0) and (exclude_first_n_periods == 0)):
-        obs_period    = data[:-exclude_last_n_periods,0]           
-        obs_grp_vel   = data[:-exclude_last_n_periods,1]/1e3       
-        
-    elif ( (exclude_first_n_periods > 0) and (exclude_last_n_periods > 0) ):
-        obs_period    = data[exclude_first_n_periods:-exclude_last_n_periods,0]           
-        obs_grp_vel   = data[exclude_first_n_periods:-exclude_last_n_periods,1]/1e3        
-        
-    else:
-        obs_period    = data[::,0]           
-        obs_grp_vel   = data[::,1]/1e3           
-        
+    obs_period, obs_grp_vel = validate_dispersion_file(
+        dispfilename,
+        exclude_first_n_periods=exclude_first_n_periods,
+        exclude_last_n_periods=exclude_last_n_periods,
+    )
 
     plt.semilogx(obs_period,obs_grp_vel,'r+',label='Measured')
 
@@ -397,7 +482,7 @@ for dispfilename in dispfiles:
     ######################################################
     # Dispersion curve
     #best_res.plot_curve(
-    #                    t, 0, "rayleigh", "group",
+    #                    t, mode, wave_type, velocity_type,
     #                    show="all",
     #                    ax=ax1,
     #                    plot_args={
@@ -414,7 +499,7 @@ for dispfilename in dispfiles:
                 )
 
     best_res.plot_curve(
-                        t, 0, "rayleigh", "group",
+                        t, mode, wave_type, velocity_type,
                         show="best",
                         ax=ax1,
                         plot_args={
@@ -422,13 +507,14 @@ for dispfilename in dispfiles:
                                     "xaxis": "period",
                                     "color": "red",
                                     "linestyle": "--",
-                                    "label": "Best",
+                                    "label": f"Best (mode {mode})",
                                    },
                         )
 
     ax1.set_xlabel('Period(s)', fontsize=20, fontweight='bold')
-    ax1.set_ylabel('Group Velocity (km/s)', fontsize=20, fontweight='bold')
+    ax1.set_ylabel(f'{velocity_type.capitalize()} Velocity (km/s)', fontsize=20, fontweight='bold')
     ax1.set_xlim(T_lim1, T_lim2)
+    ax1.set_title(f'{wave_type.capitalize()} mode {mode}')
     ax1.xaxis.set_major_formatter(ScalarFormatter())
     ax1.xaxis.set_minor_formatter(ScalarFormatter())
     ax1.legend(loc=1, frameon=False)
@@ -459,12 +545,15 @@ for dispfilename in dispfiles:
     # text file
     # IMPORTANT: str(res) writes the full best-fit model returned by the inversion.
     # It is not truncated to max_depth or max_vis_depth.
-    sacfname = Path(dispfilename.strip()).stem
+    sacfname = Path(dispfilename).stem
     modfname = sacfname + ".txt"
 
     with open(modfname, "w", encoding="utf-8") as f:
         f.write(str(res))
         f.write("\n")
+        f.write(f"Mode\t{mode}\n")
+        f.write(f"WaveType\t{wave_type}\n")
+        f.write(f"VelocityType\t{velocity_type}\n")
         f.write(f"Vs30(m/s)\t{vs30_inv:.0f}\n")
 
 
