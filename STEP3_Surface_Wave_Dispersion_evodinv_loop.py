@@ -75,7 +75,18 @@ model = EarthModel()
     #        model.add(Layer([0.0010, 0.0020], [1.0, 2.0]))
     #        model.add(Layer([0.0020, 0.0050], [2.0, 3.0]))
     #                     .... and so on ....
-    
+
+# IMPORTANT ON TOTAL MODEL DEPTH:
+# The inversion model depth is controlled by the sum of all layer thicknesses, not by max_depth below.
+# Therefore, the total fitted model depth will lie somewhere between:
+#       minimum total depth = thick_min * num_layers
+#       maximum total depth = thick_max * num_layers
+# With the default settings below, that means:
+#       minimum total depth = 0.001 km * 30 = 0.030 km = 30 m
+#       maximum total depth = 0.010 km * 30 = 0.300 km = 300 m
+# The written inversion output (.txt) therefore reports the full best-fit model over this layer-defined depth range.
+# If you want the inversion itself to be limited to a shallower total depth, you must change thick_min,
+# thick_max and/or num_layers so that their cumulative thickness matches the intended investigation depth.
 # Tip: Consider the utility of the model before constructing the model. e.g. For computing Vs30, no need to 
 # construct models deeper than about 40 m. 
 
@@ -99,9 +110,21 @@ velocity_type       = "group"         # options: "phase" "group"
 increasing_vel_flag = "True"          # Set inversion to unconstrained or constrained. options: True, False
                                       # False - unconstrained inversion, velocity jumps across layers are unconstrained
                                       # True - constrained inversion, velocity always increases with depth and across layers
-max_depth           = 0.040           # maximum depth of expected investigation [kilometers]
-                                      # There is no need to exceed 0.050 km usually and 0.040 km is best for Vs30 estimates
-                                      # only used in constrained inversion
+max_depth           = 0.040           # expected/target investigation depth [kilometers]
+                                      # WHAT max_depth PRACTICALLY DOES IN THIS SCRIPT:
+                                      # 1. It is passed into factory.prior(x, [0.0, max_depth], [vs_min, vs_max], alpha=smooth_fact)
+                                      #    when increasing_vel_flag == "True". In that constrained-inversion case, max_depth contributes
+                                      #    to a soft regularization / prior term used during optimization.
+                                      # 2. Because it enters that prior term, it can influence the inversion result indirectly by
+                                      #    changing how candidate models are penalized, especially in the constrained inversion mode.
+                                      # 3. It is also reused as the default plotting depth when max_vis_depth = max_depth, so it controls
+                                      #    how deep the Vs profile figure is displayed unless max_vis_depth is changed separately.
+                                      # WHAT max_depth DOES NOT DO:
+                                      # - it does NOT hard-limit the cumulative thickness of the fitted model
+                                      # - it does NOT change num_layers
+                                      # - it does NOT truncate the written output model text file
+                                      # Therefore, changing max_depth may change inversion behavior in constrained mode and will change
+                                      # the plotting depth by default, but the full output model can still extend deeper than max_depth.
 smooth_fact         = 1.0e-3          # Factor for smoothing the velocity between layers, i.e. drastic velocity perturbations
                                       # usually do not occur in reality if the model is finely parameterised. Smoothing_fact
                                       # penalizes models with sharp deviations of velocity across layer interfaces. 
@@ -111,7 +134,7 @@ smooth_fact         = 1.0e-3          # Factor for smoothing the velocity betwee
 
 ############################################
 # 6. VISUALIZATION PARAMETERS
-max_vis_depth        = max_depth    # maximum depth for Vs profile figure and <= max_depth  
+max_vis_depth        = max_depth    # maximum depth shown in the Vs profile figure; this is only a plotting limit and should be <= total modeled depth  
 resolution           = 300          # dots-per-inch (dpi) resolution of figures, for publication quality; dpi > 300
 threshold_percentile = 20           # This is the percentile of misfit values used for selecting the model ensemble
                                     # to make figures and compute standard deviation.
@@ -434,6 +457,8 @@ for dispfilename in dispfiles:
     ######################################################
     # Write out results + save figures
     # text file
+    # IMPORTANT: str(res) writes the full best-fit model returned by the inversion.
+    # It is not truncated to max_depth or max_vis_depth.
     sacfname = Path(dispfilename.strip()).stem
     modfname = sacfname + ".txt"
 
