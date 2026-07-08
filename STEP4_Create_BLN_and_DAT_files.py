@@ -24,6 +24,14 @@
 #                   Preserved DAT output structure expected by STEP5.
 #
 #                   OpenAI Copilot
+#
+# 8 July 2026       Reworked sac.txt parsing to tolerate real STEP3 output files
+#                   that contain headers, separators, side-by-side parameter tables,
+#                   and footer metadata.
+#                   Parsing now extracts only the left-hand 4-column velocity model
+#                   rows and skips all non-data lines.
+#
+#                   OpenAI Copilot
 
 import glob
 import os
@@ -154,17 +162,49 @@ def write_bln_file(path, distance, elevation):
 
 
 
-def read_sac_layers(vs_file):
-    """Read layer thickness and property columns from a STEP3 sac.txt output."""
-    d1 = np.genfromtxt(vs_file, skip_header=8, skip_footer=7, usecols=0) * 1e3
-    vp = np.genfromtxt(vs_file, skip_header=8, skip_footer=7, usecols=1) * 1e3
-    vs = np.genfromtxt(vs_file, skip_header=8, skip_footer=7, usecols=2) * 1e3
-    rho = np.genfromtxt(vs_file, skip_header=8, skip_footer=7, usecols=3) * 1e3
+def _parse_left_model_row(line):
+    """Return first four numeric values from a STEP3 left-hand model row, else None."""
+    parts = line.strip().split()
+    if len(parts) < 4:
+        return None
 
-    d1 = np.atleast_1d(d1).astype(float)
-    vp = np.atleast_1d(vp).astype(float)
-    vs = np.atleast_1d(vs).astype(float)
-    rho = np.atleast_1d(rho).astype(float)
+    try:
+        values = [float(parts[i]) for i in range(4)]
+    except ValueError:
+        return None
+
+    d_km, vp_kms, vs_kms, rho_gcc = values
+    if d_km <= 0 or vp_kms <= 0 or vs_kms <= 0 or rho_gcc <= 0:
+        return None
+
+    return values
+
+
+
+def read_sac_layers(vs_file):
+    """Read left-hand d, vp, vs, rho model rows from a STEP3 sac.txt output."""
+    vs_file = Path(vs_file)
+    if not vs_file.exists():
+        raise FileNotFoundError(vs_file)
+
+    rows = []
+    with vs_file.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            parsed = _parse_left_model_row(line)
+            if parsed is not None:
+                rows.append(parsed)
+
+    if not rows:
+        raise ValueError("No layer data found in sac.txt file.")
+
+    arr = np.asarray(rows, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] != 4:
+        raise ValueError("Parsed sac.txt layer array has unexpected shape.")
+
+    d1 = arr[:, 0] * 1e3
+    vp = arr[:, 1] * 1e3
+    vs = arr[:, 2] * 1e3
+    rho = arr[:, 3] * 1e3
 
     if not (len(d1) == len(vp) == len(vs) == len(rho)):
         raise ValueError("Layer columns in sac.txt file are not the same length.")
