@@ -20,50 +20,53 @@ df = pd.read_excel(excel_path, sheet_name=SHEET_NAME)
 
 def read_waveform_auto(path: Path):
     """
-    Read SEG-Y (big- or little-endian), SEG-2, or data stored as .dat.
-    Extension-based routing with silent endian retry and SEG-2 fallback.
+    Read a seismic waveform file using a layered strategy:
+
+      1. Try ObsPy auto-detection (no format specified) — handles the widest
+         range of SEG-Y dialects, SEG-2, and other supported formats.
+      2. If that fails, explicitly retry SEG-Y with both endians.
+      3. If that fails, explicitly retry SEG-2.
+      4. If all attempts fail, raise a RuntimeError with a clear summary of
+         what was tried.
+
+    All intermediate errors are printed so you can see exactly what ObsPy
+    reported for each attempt.
     """
+    errors = []
 
-    ext = path.suffix.lower()
+    # --- Strategy 1: ObsPy auto-detect ---
+    try:
+        st = read(str(path))
+        print(f"  [ok] {path.name}: read via ObsPy auto-detect")
+        return st
+    except Exception as e:
+        errors.append(f"  auto-detect : {e}")
+        print(f"  [warn] {path.name} auto-detect failed: {e}")
 
-    def try_segy(p: Path):
-        for endian in (">", "<"):
-            try:
-                return read(str(p), format="SEGY", endian=endian)
-            except Exception:
-                pass
-        return None
-
-    def try_seg2(p: Path):
+    # --- Strategy 2: Explicit SEG-Y (big then little endian) ---
+    for endian, label in ((">", "big-endian"), ("<", "little-endian")):
         try:
-            return read(str(p), format="SEG2")
-        except Exception:
-            return None
-
-    # Explicit SEG-Y extensions
-    if ext in (".segy", ".sgy"):
-        st = try_segy(path)
-        if st is not None:
+            st = read(str(path), format="SEGY", endian=endian)
+            print(f"  [ok] {path.name}: read as SEG-Y ({label})")
             return st
-        raise RuntimeError(f"{path.name} could not be read as SEG-Y")
+        except Exception as e:
+            errors.append(f"  SEGY {label}: {e}")
+            print(f"  [warn] {path.name} SEGY {label} failed: {e}")
 
-    # Explicit SEG-2 extensions
-    if ext in (".seg2", ".sg2"):
-        st = try_seg2(path)
-        if st is not None:
-            return st
-        raise RuntimeError(f"{path.name} could not be read as SEG-2")
-
-    # .dat or unknown extension: try SEG-Y first, then SEG-2
-    st = try_segy(path)
-    if st is not None:
+    # --- Strategy 3: Explicit SEG-2 ---
+    try:
+        st = read(str(path), format="SEG2")
+        print(f"  [ok] {path.name}: read as SEG-2")
         return st
+    except Exception as e:
+        errors.append(f"  SEG2        : {e}")
+        print(f"  [warn] {path.name} SEG-2 failed: {e}")
 
-    st = try_seg2(path)
-    if st is not None:
-        return st
-
-    raise RuntimeError(f"{path.name} could not be read as SEG-Y or SEG-2")
+    # --- All strategies exhausted ---
+    raise RuntimeError(
+        f"\n{path.name} could not be read. Attempts made:\n" +
+        "\n".join(errors)
+    )
 
 
 for index, row in df.iterrows():
@@ -89,7 +92,7 @@ for index, row in df.iterrows():
 
     print(f"\nRow {index}: {in_path.name} | trace {geophone + 1} | output {out_path.name}")
 
-    # ---- Read waveform (SEG-Y / SEG-2 / .dat) ----
+    # ---- Read waveform ----
     st = read_waveform_auto(in_path)
 
     if geophone < 0 or geophone >= len(st):
