@@ -31,7 +31,7 @@
 #                   Parsing now extracts only the left-hand 4-column velocity model
 #                   rows and skips all non-data lines.
 #
-#                   OpenAI Copilot
+#                   Abe Jones, implemented via GitHub OpenAI Copilot
 
 import glob
 import os
@@ -49,7 +49,7 @@ from tkinter import filedialog, messagebox, simpledialog
 project_prefix      = "Rentails_"       ## Start string of all output files
 spreadsheet_name    = "ShotData.xlsx"   ## Ignored if line below (SpecifySpreadsheet) = True
 SpecifySpreadsheet  = False              ## If set to True, user is prompted to specify the ShotData.xlsx file.
-BLN_depth_cutoff    = 30                 ## Lower bound of BLN file
+BLN_depth_cutoff    = 30                 ## Lower bound of blanking (BLN) file in m. typically 30 - 50 m
 BLN_max_DepthIsRL   = False              ## False = BLN lower bound is depth below min Z. True = BLN lower bound is elevation in RL.
 ########################################
 
