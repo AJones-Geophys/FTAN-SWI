@@ -12,7 +12,7 @@
 # dist     [m]           : source-receiver separation
 # alpha_fact [numerical] : bandwidth of Gaussian filters such that
 #                          bandwidth = (max_freq - min_freq)/alpha_fact                               
-# dt [s]                 : sampling period of [sfile]
+# dt [s]                 : sampling period of [sfile]. i.e.  1/[samples/sec]. e.g. if sac file is recorded with 8000 samples/second, dt = 1/8000 = .000125
 # levels [percentage]    : contours for percentage signal strength (0%-100%)
 #                          enter this as an array (e.g. [70, 80, 90])
 #
@@ -101,8 +101,8 @@ Vmin       = 0
 Vmax       = 1500
 dist       = 21
 alpha_fact = 12
-dt         = 0.000125
-levels     = [90, 95]
+dt         = 0.000125 
+levels     = [90, 95] # levels for plotting contours
 
 ##############################################################################
 #########################    USER INPUT END       ############################
