@@ -34,10 +34,10 @@ from scipy.interpolate import interp1d
 # ============================================================
 # USER INPUTS
 # ============================================================
-output_filename = "Line1_surfer_xyz.dat"
+output_filename = "Surfer_xyz.dat"
 
 # Vertical sampling interval for generated profile grid.
-sampling_interval_m = 5.0
+sampling_interval_m = 2.0
 
 # Width of linear transition zone centered on each interface.
 # Set <= 0 to disable smoothing.
