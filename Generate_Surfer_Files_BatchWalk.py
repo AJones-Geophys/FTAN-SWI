@@ -63,34 +63,31 @@ def normalize_line_token(token: str) -> str:
 
 def extract_alignment_key(name: str):
     """
-    Extract an alignment key from file names such as:
-      - FTAN_H-01_(Line1)_1x0.5_surfer_output.dat
-      - SRT_V-01_(Line3)_surfer_output.dat
-      - H-01_Line1_ShotData.xlsx
-      - V-06_Line10_ShotData.xlsx
-
-    Returns tuple (profile, line), e.g. ("H-01", "LINE1")
-    or None if key cannot be extracted.
+    Extract alignment key from names like:
+      FTAN_H-01_(Line1)_1x0.5_surfer_output.dat
+      SRT_V-01_(Line3)_surfer_output.dat
+      H-01_Line1_ShotData.xlsx
+      V-06_Line10_ShotData.xlsx
+    Returns: (profile, line) e.g. ("H-01", "LINE1")
     """
     base = os.path.basename(name)
     stem = os.path.splitext(base)[0]
 
-    # Remove known prefixes for DAT names
-    stem = re.sub(r"^(FTAN|SRT)[_\-]", "", stem, flags=re.IGNORECASE)
+    # remove common prefixes
+    stem = re.sub(r"^(FTAN|SRT)[_-]*", "", stem, flags=re.IGNORECASE)
 
-    # Profile token like H-01, V-06, H01, V6
-    profile_match = re.search(r"\b([HV])\s*[-_]?\s*(\d{1,2})\b", stem, flags=re.IGNORECASE)
-    if not profile_match:
+    # profile: H-01, H01, H_01, V-6, etc.
+    m_profile = re.search(r"([HV])\s*[-_]*\s*(\d{1,2})", stem, flags=re.IGNORECASE)
+    if not m_profile:
         return None
+    profile = f"{m_profile.group(1).upper()}-{int(m_profile.group(2)):02d}"
 
-    profile = f"{profile_match.group(1).upper()}-{int(profile_match.group(2)):02d}"
-
-    # Line token like (Line1), Line_10, line6
-    line_match = re.search(r"\bLINE\s*[_\-]?\s*(\d{1,3})\b", stem, flags=re.IGNORECASE)
-    if not line_match:
+    # line: Line1, (Line10), line_3, etc.
+    m_line = re.search(r"LINE\s*[-_]*\s*(\d{1,3})", stem, flags=re.IGNORECASE)
+    if not m_line:
         return None
+    line = f"LINE{int(m_line.group(1))}"
 
-    line = f"LINE{int(line_match.group(1))}"
     return profile, line
 
 
@@ -333,7 +330,7 @@ def process_one(dat_path, positioning_excel):
     print(f"  Wrote {out_csv}")
 
     if WRITE_SPACE_DELIM_DAT:
-        out_dat_df = out.dropna(subset=["Velocity"]) 
+        out_dat_df = out.dropna(subset=["Velocity"])
         out_dat_df[["Easting", "Northing", "Elevation", "Velocity"]].to_csv(
             out_dat,
             index=False,
